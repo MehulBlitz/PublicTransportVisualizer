@@ -1,0 +1,35 @@
+{
+  "version": "1.0.0",
+  "city": "Mumbai",
+  "lines": [
+    "Western Line",
+    "Central Line",
+    "Harbour Line",
+    "Trans-Harbour Line",
+    "Port Line",
+    "Vasai Road-Roha Line"
+  ],
+  "stations": [
+    "Churchgate", "CSMT", "Mumbai Central", "Dadar", "Bandra", "Andheri", "Borivali", 
+    "Bhayandar", "Vasai Road", "Virar", "Dahanu Road", "Parel", "Kurla", "Ghatkopar", 
+    "Thane", "Dombivli", "Kalyan", "Kasara", "Khopoli", "Sandhurst Road", "Wadala Road", 
+    "Mahim Junction", "Vashi", "Nerul", "Belapur", "Panvel"
+  ],
+  "transit_types": [
+    "Slow Local",
+    "Fast Local",
+    "AC Local"
+  ],
+  "crowd_labels": [
+    "Low/Seated",
+    "Moderate/Standing",
+    "Heavy Crush Load",
+    "Super Dense Crush Load (SDCL)"
+  ],
+  "weather_conditions": [
+    "Clear",
+    "Light Rain",
+    "Heavy Monsoon Rain",
+    "Waterlogging"
+  ]
+}

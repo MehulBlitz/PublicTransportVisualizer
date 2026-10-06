@@ -3,6 +3,7 @@
 import os
 import re
 import io
+import json
 import math
 import tempfile
 import requests
@@ -21,6 +22,78 @@ np.random.seed(42)
 
 print("Dependencies successfully imported!")
 
+# ---------- Mumbai Suburban Railway metadata ----------
+# transit_meta.json (shared with the Android asset) is the single source of truth
+# for the network: this module loads it so the demo dataset, line/station dropdowns
+# and weather options all reflect the real Western/Central/Harbour/Trans-Harbour/
+# Port/Vasai Road-Roha lines and their rolling stock.
+TRANSIT_META_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "proj", "android", "app", "src", "main", "assets", "transit_meta.json",
+)
+
+_FALLBACK_META = {
+    "version": "1.0.0",
+    "city": "Mumbai",
+    "lines": [
+        "Western Line", "Central Line", "Harbour Line",
+        "Trans-Harbour Line", "Port Line", "Vasai Road-Roha Line",
+    ],
+    "stations": [
+        "Churchgate", "CSMT", "Mumbai Central", "Dadar", "Bandra", "Andheri", "Borivali",
+        "Bhayandar", "Vasai Road", "Virar", "Dahanu Road", "Parel", "Kurla", "Ghatkopar",
+        "Thane", "Dombivli", "Kalyan", "Kasara", "Khopoli", "Sandhurst Road", "Wadala Road",
+        "Mahim Junction", "Vashi", "Nerul", "Belapur", "Panvel",
+    ],
+    "transit_types": ["Slow Local", "Fast Local", "AC Local"],
+    "weather_conditions": ["Clear", "Light Rain", "Heavy Monsoon Rain", "Waterlogging"],
+}
+
+def load_transit_meta():
+    """Reads the shared transit_meta.json, falling back to the embedded defaults."""
+    try:
+        with open(TRANSIT_META_PATH, "r", encoding="utf-8") as fh:
+            meta = json.load(fh)
+        required = ("lines", "stations", "transit_types", "weather_conditions")
+        if all(meta.get(key) for key in required):
+            return meta
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    return _FALLBACK_META
+
+TRANSIT_META = load_transit_meta()
+
+# Stations served by each line, including the shared interchange hubs
+# (Dadar, Kurla, Wadala Road) that are critical for network connectivity.
+LINE_STATIONS = {
+    "Western Line": ["Churchgate", "Mumbai Central", "Dadar", "Bandra", "Andheri",
+                     "Borivali", "Bhayandar", "Vasai Road", "Virar", "Dahanu Road"],
+    "Central Line": ["CSMT", "Sandhurst Road", "Parel", "Dadar", "Kurla", "Ghatkopar",
+                     "Thane", "Dombivli", "Kalyan", "Kasara", "Khopoli"],
+    "Harbour Line": ["CSMT", "Sandhurst Road", "Wadala Road", "Mahim Junction", "Kurla",
+                     "Vashi", "Nerul", "Belapur", "Panvel"],
+    "Trans-Harbour Line": ["Thane", "Vashi", "Nerul", "Panvel"],
+    "Port Line": ["CSMT", "Sandhurst Road", "Wadala Road", "Mahim Junction"],
+    "Vasai Road-Roha Line": ["Vasai Road", "Bhayandar", "Panvel"],
+}
+
+# Approximate per-rake capacity by rolling stock.
+TYPE_CAPACITY = {"Slow Local": 500, "Fast Local": 560, "AC Local": 700}
+
+WEATHER_PROB = {
+    "Clear": 0.55, "Light Rain": 0.20, "Heavy Monsoon Rain": 0.15, "Waterlogging": 0.10,
+}
+WEATHER_FACTOR = {
+    "Clear": 1.0, "Light Rain": 0.92, "Heavy Monsoon Rain": 0.80, "Waterlogging": 0.70,
+}
+
+# Mumbai suburban rush windows, matching proj/tflite_export/train_and_export.py.
+MORNING_PEAK = (8, 11)
+EVENING_PEAK = (17, 21)
+
+def _in_peak(hour):
+    return (MORNING_PEAK[0] <= hour <= MORNING_PEAK[1]) or (EVENING_PEAK[0] <= hour <= EVENING_PEAK[1])
+
 class TransitDataEngine:
     """Manages dataset ingestion, automatic mapping, cleaning, and feature engineering."""
     def __init__(self):
@@ -34,80 +107,59 @@ class TransitDataEngine:
 
     @staticmethod
     def generate_demo_dataset(num_days=30):
-        """Generates a highly realistic transit dataset with logical peaks, routes, and capacities."""
-        routes = ["Route 101 (Metro-Link)", "Route 205 (Downtown Express)", "Route 42 (Suburban Shuttle)"]
-        stations = {
-            "Route 101 (Metro-Link)": ["Central Station", "Tech Park", "West Terminal"],
-            "Route 205 (Downtown Express)": ["North Gate", "Financial District", "Central Station"],
-            "Route 42 (Suburban Shuttle)": ["Suburban Mall", "Green Valley", "Central Station"]
-        }
-        modes = {
-            "Route 101 (Metro-Link)": "Train",
-            "Route 205 (Downtown Express)": "Bus",
-            "Route 42 (Suburban Shuttle)": "Bus"
-        }
-        capacities = {
-            "Route 101 (Metro-Link)": 500,
-            "Route 205 (Downtown Express)": 80,
-            "Route 42 (Suburban Shuttle)": 50
-        }
+        """Generates a realistic Mumbai Suburban Railway dataset driven by transit_meta.json."""
+        meta = TRANSIT_META
+        station_roster = set(meta.get("stations", []))
+        lines = [ln for ln in meta.get("lines", []) if LINE_STATIONS.get(ln)]
+        transit_types = meta.get("transit_types") or ["Train"]
+        weathers = meta.get("weather_conditions") or ["Clear"]
+        weights = np.array([WEATHER_PROB.get(w, 1.0) for w in weathers], dtype=float)
+        weights = weights / weights.sum()
 
         data = []
         start_date = datetime.now() - timedelta(days=num_days)
-        weathers = ["Clear", "Rainy", "Overcast"]
-        weather_probs = [0.7, 0.2, 0.1]
 
         for day in range(num_days):
             current_date = start_date + timedelta(days=day)
             is_weekend = 1 if current_date.weekday() >= 5 else 0
-            weather = np.random.choice(weathers, p=weather_probs)
-            temp = np.random.randint(15, 32) if weather != "Rainy" else np.random.randint(10, 20)
+            weather = np.random.choice(weathers, p=weights)
+            temp_hi = 28 if weather in ("Heavy Monsoon Rain", "Waterlogging") else 35
+            temp = np.random.randint(22, temp_hi)
 
-            for route in routes:
-                mode = modes[route]
-                cap = capacities[route]
-                route_stations = stations[route]
-
+            for line in lines:
+                route_stations = [s for s in LINE_STATIONS[line] if s in station_roster]
                 for station in route_stations:
-                    for hour in range(6, 24):  # Transit operates from 06:00 to 23:00
-                        # Heuristics for peak demand
-                        is_peak = False
-                        base_demand = 0
-
-                        if is_weekend:
-                            if 11 <= hour <= 16:  # Midday peak on weekends
-                                base_demand = cap * 0.7
-                                is_peak = True
-                            else:
-                                base_demand = cap * 0.25
-                        else:
-                            if 7 <= hour <= 9:  # Morning peak
+                    for commute_type in transit_types:
+                        cap = TYPE_CAPACITY.get(commute_type, 500)
+                        for hour in range(6, 24):  # Suburban services run 06:00-23:00
+                            # Mumbai demand heuristics: weekday rush windows + weekend midday peak
+                            if is_weekend:
+                                base_demand = cap * (0.7 if 11 <= hour <= 16 else 0.25)
+                            elif MORNING_PEAK[0] <= hour <= MORNING_PEAK[1]:
                                 base_demand = cap * 1.15
-                                is_peak = True
-                            elif 17 <= hour <= 19:  # Evening peak
+                            elif EVENING_PEAK[0] <= hour <= EVENING_PEAK[1]:
                                 base_demand = cap * 1.25
-                                is_peak = True
                             elif 11 <= hour <= 14:
                                 base_demand = cap * 0.5
                             else:
                                 base_demand = cap * 0.15
 
-                        # Apply random noise and weather factor
-                        noise = np.random.normal(0, cap * 0.08)
-                        weather_factor = 0.85 if weather == "Rainy" else 1.0
+                            # Apply random noise and weather factor
+                            noise = np.random.normal(0, cap * 0.08)
+                            weather_factor = WEATHER_FACTOR.get(weather, 1.0)
 
-                        ridership = max(0, int(base_demand * weather_factor + noise))
+                            ridership = max(0, int(base_demand * weather_factor + noise))
 
-                        data.append({
-                            "timestamp": current_date.replace(hour=hour, minute=0, second=0),
-                            "service_route": route,
-                            "station_stop": station,
-                            "transport_mode": mode,
-                            "passenger_count": ridership,
-                            "vehicle_capacity": cap,
-                            "weather_condition": weather,
-                            "temperature_celsius": temp
-                        })
+                            data.append({
+                                "timestamp": current_date.replace(hour=hour, minute=0, second=0),
+                                "service_route": line,
+                                "station_stop": station,
+                                "transport_mode": commute_type,
+                                "passenger_count": ridership,
+                                "vehicle_capacity": cap,
+                                "weather_condition": weather,
+                                "temperature_celsius": temp
+                            })
 
         return pd.DataFrame(data)
 
@@ -234,10 +286,10 @@ class TransitDataEngine:
         df['hour'] = df[date_col].dt.hour
         df['weekend'] = df['day_of_week'].apply(lambda x: 1 if x >= 5 else 0)
 
-        # Categorize peak windows
-        df['morning_peak'] = df['hour'].apply(lambda h: 1 if 7 <= h <= 9 else 0)
-        df['evening_peak'] = df['hour'].apply(lambda h: 1 if 17 <= h <= 19 else 0)
-        df['peak_hour'] = df['hour'].apply(lambda h: 1 if (7 <= h <= 9) or (17 <= h <= 19) else 0)
+        # Categorize peak windows (Mumbai suburban rush)
+        df['morning_peak'] = df['hour'].apply(lambda h: 1 if MORNING_PEAK[0] <= h <= MORNING_PEAK[1] else 0)
+        df['evening_peak'] = df['hour'].apply(lambda h: 1 if EVENING_PEAK[0] <= h <= EVENING_PEAK[1] else 0)
+        df['peak_hour'] = df['hour'].apply(lambda h: 1 if _in_peak(h) else 0)
 
         # Lag features are computed per route AND station, so a row only ever sees
         # the same stop's earlier hours (never a sibling station's same-hour value).
@@ -338,8 +390,8 @@ class TransitPredictor:
 
         # Recalculate feature attributes
         is_weekend = 1 if day_of_week >= 5 else 0
-        m_peak = 1 if 7 <= hour <= 9 else 0
-        e_peak = 1 if 17 <= hour <= 19 else 0
+        m_peak = 1 if MORNING_PEAK[0] <= hour <= MORNING_PEAK[1] else 0
+        e_peak = 1 if EVENING_PEAK[0] <= hour <= EVENING_PEAK[1] else 0
         p_hour = 1 if (m_peak or e_peak) else 0
 
         feat_dict = {
@@ -602,7 +654,7 @@ def run_live_predictions(route_name, day_of_week_str, hour, prev_demand, weather
     expected = int(val_pred)
 
     capacity_val = route_capacity(route_name)
-    is_peak = (7 <= hour <= 9) or (17 <= hour <= 19)
+    is_peak = _in_peak(hour)
     occ_pct, risk_level = TransitDecisionCore.calculate_occupancy(expected, capacity_val)
     alloc = TransitDecisionCore.optimize_allocation(expected, capacity_val, is_peak_hour=is_peak)
 
@@ -645,7 +697,7 @@ def export_recommendations_csv():
     recs = []
     for idx, row in agg_df.iterrows():
         hr = int(row['hour'])
-        is_peak = (7 <= hr <= 9) or (17 <= hr <= 19)
+        is_peak = _in_peak(hr)
         alloc = TransitDecisionCore.optimize_allocation(row[rid_col], row[cap_col], is_peak_hour=is_peak)
         if alloc["add_vehicles"] > 0 or alloc["freq_adjustment_pct"] != 0:
             recs.append({
@@ -910,7 +962,7 @@ with gr.Blocks() as demo:
                             to_st = gr.Dropdown(choices=STATIONS, label="To (Select station / stop)", value=STATIONS[1] if len(STATIONS) > 1 else None)
                             j_date = gr.Textbox(label="Date", value=str(datetime.now().strftime("%Y-%m-%d")))
                             j_time = gr.Slider(minimum=0, maximum=23, step=1, label="Time of Departure (Hour)", value=18)
-                            j_mode = gr.Dropdown(choices=MODES, label="Transport Preference", value=MODES[0])
+                            j_mode = gr.Dropdown(choices=MODES, label="Commute Type / Rolling Stock", value=MODES[0])
                             btn_journey = gr.Button("FIND BEST OPTION", variant="primary")
                         with gr.Column():
                             journey_output = gr.HTML(value="<p style='color:#102a43; font-weight: bold;'>Fill options and click Find Best Option to execute intelligence forecast.</p>")
@@ -939,8 +991,8 @@ with gr.Blocks() as demo:
                     gr.Markdown("### File a direct crowd or operational service report to transit authorities")
                     with gr.Row():
                         with gr.Column():
-                            rep_loc = gr.Textbox(label="Location / Station Name", value="Central Station")
-                            rep_route = gr.Textbox(label="Route/Station Involved", value="Route 101 (Metro-Link)")
+                            rep_loc = gr.Textbox(label="Location / Station Name", value="Dadar")
+                            rep_route = gr.Textbox(label="Route/Station Involved", value="Central Line")
                             rep_type = gr.Dropdown(choices=["Overcrowding", "Bus unavailable", "Train overcrowded", "Long waiting time", "Service delay", "Service cancellation", "Poor station condition", "Accessibility issue", "Other"], label="Problem Type", value="Overcrowding")
                             rep_sev = gr.Dropdown(choices=["🟢 Low", "🟡 Moderate", "🟠 High", "🔴 Critical"], label="Severity Level", value="🔴 Critical")
                             rep_desc = gr.Textbox(label="Detailed Description", value="The platform is extremely busy during peak hour, leaving many unable to board.")
@@ -961,8 +1013,8 @@ with gr.Blocks() as demo:
                         kpi2 = gr.Number(label="Avg Hourly Load", value=154)
                         kpi3 = gr.Textbox(label="Peak Hour System-Wide", value="18:00")
                     with gr.Row():
-                        kpi4 = gr.Textbox(label="High-Demand Route Node", value="Route 101 (Metro-Link)")
-                        kpi5 = gr.Textbox(label="Maximum Risk Station", value="Central Station")
+                        kpi4 = gr.Textbox(label="High-Demand Route Node", value="Central Line")
+                        kpi5 = gr.Textbox(label="Maximum Risk Station", value="Dadar")
                         kpi6 = gr.Number(label="Overcapacity Incidents (Critical)", value=42)
                     with gr.Row():
                         btn_refresh = gr.Button("Sync & Refresh Dashboard Performance", variant="primary")
@@ -1063,11 +1115,11 @@ with demo:
 
 # Seed one sample citizen report so the authority view isn't empty
 submit_citizen_report(
-    location="Central Station",
-    route_station="Route 101 (Metro-Link)",
+    location="Dadar",
+    route_station="Central Line",
     problem_type="Overcrowding",
     severity="🔴 Critical",
-    description="Platform is extremely busy during evening peak. Passengers are unable to safely board the 18:00 Train.",
+    description="Dadar interchange is extremely crowded during the 18:00-21:00 rush. Passengers cannot board the Central Line slow locals.",
 )
 
 if __name__ == "__main__":
